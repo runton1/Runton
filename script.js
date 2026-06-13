@@ -1348,10 +1348,9 @@ function collectPending(){
   updateUI();
   updateCollector();
   showToast('Монеты собраны! 💰');
-  // Сохраняем на сервер асинхронно
-  if (getInitData()){
+  saveLocal();
+  if (getInitData())
     apiRequest('POST', '/api/collect', { amount, sessionDist }).catch(console.warn);
-  }
 }
 
 function updateCollector(){
@@ -1440,11 +1439,55 @@ function buyLimitUpgrade(i){
   updateCollector();
   closeLimitModal();
   showToast(`${u.icon} Лимит: ${fmtLimit(Game.sessionLimit)}`);
+  saveLocal();
   if (getInitData())
     apiRequest('POST', '/api/buy/limit', { upgradeIndex: i }).catch(console.warn);
 }
 
-// Хелпер — текущий стейт для сохранения
+// ── Локальное хранилище ───────────────
+const SAVE_KEY = 'runton_save';
+
+function saveLocal(){
+  try {
+    localStorage.setItem(SAVE_KEY, JSON.stringify({
+      coins:             Game.coins,
+      totalCollected:    Game.totalCollected,
+      totalDist:         Game.totalDist,
+      sessionDist:       Game.sessionDist,
+      sessionLimit:      isFinite(Game.sessionLimit) ? Game.sessionLimit : 999999999,
+      sessionRuns:       Game.sessionRuns,
+      pendingCoins:      Game.pendingCoins,
+      unlocked:          Array.from(Game.unlocked),
+      currentLoc:        Game.currentLoc,
+      activeSkin:        Game.activeSkin,
+      skinBonus:         Game.skinBonus,
+      savedAt:           Date.now(),
+    }));
+  } catch(e){}
+}
+
+function loadLocal(){
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (!raw) return false;
+    const s = JSON.parse(raw);
+    Game.coins          = s.coins          || 0;
+    Game.totalCollected = s.totalCollected || 0;
+    Game.totalDist      = s.totalDist      || 0;
+    Game.sessionDist    = s.sessionDist    || 0;
+    Game.sessionLimit   = s.sessionLimit >= 999999999 ? Infinity : (s.sessionLimit || 27648);
+    Game.sessionRuns    = s.sessionRuns    || 0;
+    Game.pendingCoins   = s.pendingCoins   || 0;
+    Game.unlocked       = new Set(s.unlocked || ['city']);
+    Game.currentLoc     = s.currentLoc    || 'city';
+    Game.activeSkin     = s.activeSkin    || null;
+    Game.skinBonus      = s.skinBonus     || 0;
+    if (Game.activeSkin) loadSprite(Game.activeSkin);
+    return true;
+  } catch(e){ return false; }
+}
+
+// ── Серверное сохранение ──────────────
 function buildSavePayload(){
   return {
     coins:             Game.coins,
@@ -1459,11 +1502,32 @@ function buildSavePayload(){
   };
 }
 
-// Автосохранение каждые 60 секунд
-setInterval(() => {
-  if (getInitData())
-    apiRequest('POST', '/api/save', buildSavePayload()).catch(console.warn);
-}, 60000);
+function saveToServer(){
+  if (!getInitData()) return;
+  apiRequest('POST', '/api/save', buildSavePayload()).catch(console.warn);
+}
+
+// Автосохранение: локально каждые 5 сек, на сервер каждые 30 сек
+setInterval(saveLocal, 5000);
+setInterval(saveToServer, 30000);
+
+// Сохраняем при закрытии/обновлении страницы
+window.addEventListener('beforeunload', () => {
+  saveLocal();
+  // sendBeacon — гарантированно доходит даже при закрытии
+  if (getInitData() && navigator.sendBeacon){
+    const payload = JSON.stringify(buildSavePayload());
+    navigator.sendBeacon(
+      'https://runton-production.up.railway.app/api/save',
+      new Blob([payload], { type: 'application/json' })
+    );
+  }
+});
+
+// Telegram — событие закрытия приложения
+if (window.Telegram?.WebApp){
+  Telegram.WebApp.onEvent('viewportChanged', saveLocal);
+}
 
 /* ═══════════════════════════════════════
    7. ГЛАВНЫЙ ЦИКЛ
@@ -1588,7 +1652,7 @@ function selectLocation(id){
     showToast(`${loc.icon} ${loc.name} открыта! ${inc.totalTon.toFixed(2)} TON за 5.97 млн м`);
     updateUI();
     buildLocCards();
-    // Сохраняем на сервер
+    saveLocal();
     if (getInitData())
       apiRequest('POST', '/api/buy/location', { locationId: id }).catch(console.warn);
   }
@@ -1728,6 +1792,7 @@ function buySkin(id){
   updateUI();
   buildSkinCards();
   showToast(`${s.name} активирован! +5% на ${s.months} мес.`);
+  saveLocal();
   if (getInitData())
     apiRequest('POST', '/api/buy/skin', { skinId: id }).catch(console.warn);
 }
@@ -1755,7 +1820,7 @@ function showToast(msg){
 ═══════════════════════════════════════ */
 
 /* ── API — связь с сервером ── */
-const API_URL = 'https://runton-production.up.railway.app'; // ← замени на свой Railway URL
+const API_URL = 'https://runton-production.up.railway.app';
 
 function getInitData(){
   return window.Telegram?.WebApp?.initData || '';
@@ -1778,23 +1843,29 @@ async function syncFromServer(){
     const data = await apiRequest('GET', '/api/user');
     if (!data.ok) return;
     const u = data.user;
-    Game.coins          = u.coins;
-    Game.totalCollected = u.totalCollected;
-    Game.totalDist      = u.totalDist;
-    Game.sessionLimit   = u.sessionLimit >= 999999999 ? Infinity : u.sessionLimit;
-    Game.sessionRuns    = u.sessionRuns;
-    Game.unlocked       = new Set(u.unlockedLocations);
-    Game.currentLoc     = u.currentLoc;
-    Game.activeSkin     = u.activeSkin;
-    Game.skinBonus      = u.skinBonus;
-    Game.tonWallet      = u.tonWallet || null;
-    if (u.activeSkin) loadSprite(u.activeSkin);
-    updateUI(); buildLocCards(); updateCollector();
 
-    // Показываем оффлайн доход если есть
+    // Берём максимум между сервером и локальным хранилищем
+    // (защита от потери прогресса если сервер отстал)
+    Game.coins          = Math.max(Game.coins, u.coins);
+    Game.totalCollected = Math.max(Game.totalCollected, u.totalCollected);
+    Game.totalDist      = Math.max(Game.totalDist, u.totalDist);
+    Game.sessionLimit   = u.sessionLimit >= 999999999 ? Infinity : Math.max(Game.sessionLimit, u.sessionLimit);
+    Game.sessionRuns    = Math.max(Game.sessionRuns, u.sessionRuns);
+
+    // Локации — объединяем
+    for (const loc of u.unlockedLocations) Game.unlocked.add(loc);
+
+    Game.currentLoc  = u.currentLoc  || Game.currentLoc;
+    Game.activeSkin  = u.activeSkin  || Game.activeSkin;
+    Game.skinBonus   = Math.max(Game.skinBonus, u.skinBonus);
+    Game.tonWallet   = u.tonWallet   || null;
+    if (Game.activeSkin) loadSprite(Game.activeSkin);
+
+    updateUI(); buildLocCards(); updateCollector();
+    saveLocal(); // сохраняем объединённый стейт локально
+
     if (u.offlinePending > 0) showOfflineModal(u.offlinePending);
 
-    // Загружаем кассу
     const cb = await apiRequest('GET', '/api/cashbox');
     if (cb.ok) { cashboxAmount = cb.cashbox; updateCashbox(); }
   } catch(e){ console.warn('syncFromServer failed:', e); }
@@ -1886,15 +1957,15 @@ window.addEventListener('load', async () => {
     const tg = Telegram.WebApp;
     tg.ready();
     tg.expand();
-    // Fullscreen — поддерживается в Telegram 8.0+
     if (tg.requestFullscreen) tg.requestFullscreen();
-    // Отключаем свайп вниз чтобы не закрывал приложение
     if (tg.disableVerticalSwipes) tg.disableVerticalSwipes();
-
-    // Выставляем CSS-переменную с высотой шапки Telegram
-    // offset задан через --tg-offset в style.css
   }
-  // Авторизация + загрузка данных с сервера
+
+  // 1. Сначала грузим локальный стейт — игра стартует мгновенно
+  loadLocal();
+  start();
+
+  // 2. Затем синхронизируем с сервером в фоне
   if (getInitData()){
     try {
       const ref = window.Telegram?.WebApp?.initDataUnsafe?.start_param || null;
@@ -1902,7 +1973,6 @@ window.addEventListener('load', async () => {
       await syncFromServer();
     } catch(e){ console.warn('Backend offline, running locally:', e); }
   }
-  start();
 });
 
 /* ═══════════════════════════════════════
