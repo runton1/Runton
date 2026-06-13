@@ -1532,14 +1532,16 @@ function loadLocal(){
       initLocIncome('city');
     }
 
-    // Оффлайн доход — считаем сколько накопилось пока не было
+    // Оффлайн доход — точно по метке времени savedAt, до секунды, без ping
     if (s.savedAt){
       const offlineSecs = (Date.now() - s.savedAt) / 1000;
-      if (offlineSecs > 30){
+      if (offlineSecs >= 1){
         const offlineEarned = calcOfflineIncome(offlineSecs);
         if (offlineEarned > 0){
           Game.pendingCoins += offlineEarned;
-          showToast(`💰 За ${Math.round(offlineSecs/60)} мин накопилось ${offlineEarned.toFixed(6)} TON`);
+          const mins = Math.floor(offlineSecs / 60);
+          const label = mins >= 1 ? `${mins} мин` : `${Math.round(offlineSecs)} сек`;
+          showToast(`💰 За ${label} накопилось ${offlineEarned.toFixed(6)} TON`);
         }
       }
     }
@@ -1611,6 +1613,22 @@ window.addEventListener('beforeunload', () => {
 if (window.Telegram?.WebApp){
   Telegram.WebApp.onEvent('viewportChanged', saveLocal);
 }
+
+// На мобильных beforeunload часто не срабатывает при сворачивании.
+// visibilitychange ловит уход в фон — ставим свежий savedAt, чтобы
+// оффлайн-доход считался точно с этого момента.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden'){
+    saveLocal();
+    if (getInitData() && navigator.sendBeacon){
+      const payload = JSON.stringify(buildSavePayload());
+      navigator.sendBeacon(
+        'https://runton-production.up.railway.app/api/save',
+        new Blob([payload], { type: 'application/json' })
+      );
+    }
+  }
+});
 
 /* ═══════════════════════════════════════
    7. ГЛАВНЫЙ ЦИКЛ
@@ -1974,10 +1992,8 @@ function showOfflineModal(amount){
   }).catch(console.warn);
 }
 
-// Ping каждые 30 секунд — обновляем lastOnline
-setInterval(() => {
-  if (getInitData()) apiRequest('POST', '/api/ping').catch(()=>{});
-}, 30000);
+// Ping больше не нужен: lastOnline обновляется при каждом /api/save (раз в 30 сек),
+// а точный оффлайн-доход клиент считает сам по метке savedAt.
 
 function refreshWallet(){
   const el = $('w-balance');
@@ -2054,7 +2070,7 @@ window.addEventListener('load', async () => {
   }
 
   // 1. Грузим локальный стейт (включает locIncome и offlineIncome)
-  loadLocal();
+  const hadLocalSave = loadLocal();
 
   // 2. Стартуем игру с восстановленными данными
   start();
@@ -2066,7 +2082,9 @@ window.addEventListener('load', async () => {
     (async () => {
       try {
         const ref = window.Telegram?.WebApp?.initDataUnsafe?.start_param || null;
-        await apiRequest('POST', '/api/auth', { ref });
+        // hadLocalSave=true → клиент уже начислил оффлайн по savedAt,
+        // сервер НЕ должен начислять повторно (избегаем двойного дохода)
+        await apiRequest('POST', '/api/auth', { ref, hadLocalSave });
         await syncFromServer();
       } catch(e){ console.warn('Backend offline, running locally:', e); }
     })();
