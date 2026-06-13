@@ -144,8 +144,7 @@ const Game = {
   playerX: 0, cameraX: 0, speed: 0, groundOffset: 0,
   frame: 0, frameTick: 0, frameDelay: 4,
 };
-// Город инициализируем сразу после создания Game
-initLocIncome('city');
+// НЕ инициализируем здесь — это делается в loadLocal или start()
 const upgradeCosts = [25, 60, 100, 150, 200];
 const SPRITE_FRAMES = 8;
 
@@ -1449,6 +1448,25 @@ function buyLimitUpgrade(i){
 // ── Локальное хранилище ───────────────
 const SAVE_KEY = 'runton_save';
 
+// Расчёт оффлайн дохода на клиенте
+function calcOfflineIncome(offlineSecs){
+  const MAX_SECS = 8 * 3600; // максимум 8 часов
+  const elapsed  = Math.min(offlineSecs, MAX_SECS);
+  const SECONDS_36 = 36 * 24 * 3600;
+  let total = 0;
+  for (const id of Game.unlocked){
+    const inc = locIncome[id];
+    if (!inc || inc.expired) continue;
+    // Средний доход локации в секунду
+    const loc = LOCATIONS[id];
+    if (!loc) continue;
+    const avgTon     = (loc.incomeMin + loc.incomeMax) / 2;
+    const ratePerSec = avgTon / SECONDS_36;
+    total += ratePerSec * elapsed;
+  }
+  return total;
+}
+
 function saveLocal(){
   try {
     // Сохраняем locIncome — данные о доходе локаций
@@ -1483,7 +1501,11 @@ function saveLocal(){
 function loadLocal(){
   try {
     const raw = localStorage.getItem(SAVE_KEY);
-    if (!raw) return false;
+    if (!raw){
+      // Нет сохранения — инициализируем с нуля
+      initLocIncome('city');
+      return false;
+    }
     const s = JSON.parse(raw);
     Game.coins          = s.coins          || 0;
     Game.totalCollected = s.totalCollected || 0;
@@ -1498,17 +1520,33 @@ function loadLocal(){
     Game.skinBonus      = s.skinBonus     || 0;
     if (Game.activeSkin) loadSprite(Game.activeSkin);
 
-    // Восстанавливаем locIncome — прогресс локаций
-    if (s.locIncome){
+    // Восстанавливаем locIncome
+    if (s.locIncome && Object.keys(s.locIncome).length > 0){
       for (const [id, inc] of Object.entries(s.locIncome)){
         locIncome[id] = { ...inc };
       }
     } else {
-      // Если нет сохранённых — инициализируем заново
       initLocIncome('city');
     }
+
+    // Оффлайн доход — считаем сколько накопилось пока не было
+    if (s.savedAt){
+      const offlineSecs = (Date.now() - s.savedAt) / 1000;
+      if (offlineSecs > 30){
+        const offlineEarned = calcOfflineIncome(offlineSecs);
+        if (offlineEarned > 0){
+          Game.pendingCoins += offlineEarned;
+          showToast(`💰 За ${Math.round(offlineSecs/60)} мин накопилось ${offlineEarned.toFixed(6)} TON`);
+        }
+      }
+    }
+
     return true;
-  } catch(e){ return false; }
+  } catch(e){
+    console.warn('loadLocal error:', e);
+    initLocIncome('city');
+    return false;
+  }
 }
 
 // ── Серверное сохранение ──────────────
@@ -1985,18 +2023,23 @@ window.addEventListener('load', async () => {
     if (tg.disableVerticalSwipes) tg.disableVerticalSwipes();
   }
 
-  // 1. Сначала грузим локальный стейт — игра стартует мгновенно
+  // 1. Грузим локальный стейт (включает locIncome и offlineIncome)
   loadLocal();
-  start();
-  updateCollector(); // восстанавливаем коллектор из сохранения
 
-  // 2. Затем синхронизируем с сервером в фоне
+  // 2. Стартуем игру с восстановленными данными
+  start();
+  updateCollector();
+  updateUI();
+
+  // 3. Синхронизируем с сервером в фоне (не блокирует игру)
   if (getInitData()){
-    try {
-      const ref = window.Telegram?.WebApp?.initDataUnsafe?.start_param || null;
-      await apiRequest('POST', '/api/auth', { ref });
-      await syncFromServer();
-    } catch(e){ console.warn('Backend offline, running locally:', e); }
+    (async () => {
+      try {
+        const ref = window.Telegram?.WebApp?.initDataUnsafe?.start_param || null;
+        await apiRequest('POST', '/api/auth', { ref });
+        await syncFromServer();
+      } catch(e){ console.warn('Backend offline, running locally:', e); }
+    })();
   }
 });
 
