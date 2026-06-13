@@ -1318,9 +1318,9 @@ function checkCollisions(){
   for (const c of coinList)
     if (c.active && Math.abs(c.x-Game.playerX) < cR) collectCoin(c);
 }
+let _saveLocalCounter = 0;
 function collectCoin(c){
   c.active=false;
-  // Если лимит метров достигнут — монеты не накапливаются
   if (Game.sessionDist < Game.sessionLimit){
     const baseValue = coinValueForLoc(Game.currentLoc);
     const skinMult = Game.skinBonus > Date.now() ? 1.05 : 1;
@@ -1328,6 +1328,8 @@ function collectCoin(c){
     const value = baseValue * mult;
     Game.pendingCoins += value;
     updateCollector();
+    // Сохраняем локально каждые 10 монеток
+    if (++_saveLocalCounter >= 10){ _saveLocalCounter = 0; saveLocal(); }
   }
   for (let i=0;i<12;i++) particles.push({
     x:c.x, y:COIN_Y, vx:rnd(-3,3), vy:rnd(-6,-1),
@@ -1964,6 +1966,7 @@ window.addEventListener('load', async () => {
   // 1. Сначала грузим локальный стейт — игра стартует мгновенно
   loadLocal();
   start();
+  updateCollector(); // восстанавливаем коллектор из сохранения
 
   // 2. Затем синхронизируем с сервером в фоне
   if (getInitData()){
