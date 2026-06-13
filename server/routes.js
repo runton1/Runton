@@ -80,7 +80,7 @@ router.post('/ping', async (req, res) => {
 
 /* ─────────────────────────────────────
    POST /api/offline/collect
-   Забрать оффлайн накопленные монеты
+   Перенести оффлайн-накопленное в коллектор (НЕ в верхний баланс)
 ───────────────────────────────────── */
 router.post('/offline/collect', async (req, res) => {
   try {
@@ -88,23 +88,14 @@ router.post('/offline/collect', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Not found' });
 
     const amount = user.offlinePending || 0;
-    if (amount <= 0) return res.json({ ok: true, earned: 0, coins: user.coins });
+    if (amount <= 0) return res.json({ ok: true, earned: 0, collectorPending: user.collectorPending || 0 });
 
-    user.coins          += amount;
-    user.totalCollected += amount;
-    user.offlinePending  = 0;
+    // Кладём оффлайн доход в коллектор, а не сразу в баланс
+    user.collectorPending = (user.collectorPending || 0) + amount;
+    user.offlinePending   = 0;
     await user.save();
 
-    // +5% рефереру
-    if (user.referredBy && amount > 0) {
-      const bonus = amount * 0.05;
-      await User.updateOne(
-        { telegramId: user.referredBy },
-        { $inc: { coins: bonus, referralEarned: bonus } }
-      );
-    }
-
-    res.json({ ok: true, earned: amount, coins: user.coins });
+    res.json({ ok: true, earned: amount, collectorPending: user.collectorPending });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -132,7 +123,7 @@ router.post('/save', async (req, res) => {
   try {
     const { coins, totalCollected, totalDist, sessionDist,
             sessionLimit, sessionRuns, unlockedLocations, currentLoc,
-            activeSkin, skinBonus } = req.body;
+            activeSkin, skinBonus, collectorPending } = req.body;
 
     await User.updateOne(
       { telegramId: req.telegramUser.id },
@@ -141,6 +132,7 @@ router.post('/save', async (req, res) => {
           sessionLimit, sessionRuns,
           unlockedLocations, currentLoc,
           activeSkin, skinBonus,
+          ...(typeof collectorPending === 'number' ? { collectorPending } : {}),
           updatedAt: Date.now(),
       }}
     );
@@ -152,7 +144,7 @@ router.post('/save', async (req, res) => {
 
 /* ─────────────────────────────────────
    POST /api/collect
-   Собрать монеты
+   Собрать монеты из коллектора в верхний баланс
 ───────────────────────────────────── */
 router.post('/collect', async (req, res) => {
   try {
@@ -163,12 +155,14 @@ router.post('/collect', async (req, res) => {
     const user = await User.findOne({ telegramId: req.telegramUser.id });
     if (!user) return res.status(404).json({ error: 'Not found' });
 
-    // Обновляем все поля
+    // Берём максимум из переданной суммы и того что накопилось на сервере
+    // (клиент передаёт своё значение — берём его как авторитетное)
     user.coins          += amount;
     user.totalCollected += amount;
     user.totalDist      += sessionDist || 0;
     user.sessionDist     = 0;
     user.sessionRuns    += 1;
+    user.collectorPending = 0;  // сбрасываем коллектор на сервере
     user.updatedAt       = Date.now();
     
     await user.save();
@@ -390,6 +384,7 @@ function formatUser(user) {
     referralEarned:    user.referralEarned,
     totalWithdrawn:    user.totalWithdrawn,
     offlinePending:    user.offlinePending || 0,
+    collectorPending:  user.collectorPending || 0,
     withdrawals:       user.withdrawals.slice(-10),
   };
 }

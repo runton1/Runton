@@ -41,6 +41,9 @@ const UserSchema = new mongoose.Schema({
   lastOnline:         { type: Date, default: Date.now },
   offlinePending:     { type: Number, default: 0 },
 
+  // Коллектор — монеты накопленные в коллекторе (не в верхнем балансе)
+  collectorPending:   { type: Number, default: 0 },
+
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
 }, { versionKey: false });
